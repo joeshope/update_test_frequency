@@ -3,6 +3,8 @@ import sys
 import os
 import json
 import time
+import re 
+from urllib.parse import urlparse  
 
 # --- Configuration ---
 
@@ -18,8 +20,8 @@ API_VERSION = "2024-05-23"
 ALLOWED_TYPES = {
     "nuget", "paket", "cpp", "hex", "golangdep", "govendor", "gomodules",
     "maven", "gradle", "npm", "pnpm", "yarn", "composer", "pip", "pipenv",
-    "poetry", "rubygems", "sbt", "cocoapods", "sast", "terraformconfig", 
-    "cloudformationconfig", "k8sconfig", "helmconfig", "armconfig", "apk", 
+    "poetry", "rubygems", "sbt", "cocoapods", "sast", "terraformconfig",
+    "cloudformationconfig", "k8sconfig", "helmconfig", "armconfig", "apk",
     "deb", "rpm", "linux", "dockerfile",
 }
 
@@ -30,7 +32,7 @@ ALL_OPEN_SOURCE = {
 }
 
 ALL_IAC = {
-    "terraformconfig", "cloudformationconfig", "k8sconfig", 
+    "terraformconfig", "cloudformationconfig", "k8sconfig",
     "helmconfig", "armconfig",
 }
 
@@ -66,6 +68,9 @@ def get_all_projects(org_id, api_token, types_list=None):
         req = requests.Request('GET', base_endpoint, params=query_params)
         prepared_req = req.prepare()
         next_url = prepared_req.url
+
+        trusted_hostname = urlparse(API_HOST).netloc
+
     except Exception as e:
         print(f"Error preparing initial request URL: {e}")
         return None
@@ -87,14 +92,22 @@ def get_all_projects(org_id, api_token, types_list=None):
             next_link = response_json.get("links", {}).get("next")
 
             if next_link:
-                if next_link.startswith("/"):
+                parsed_link = urlparse(next_link)
+                
+                if not parsed_link.netloc and parsed_link.path.startswith("/"):
                     next_url = f"{API_HOST}{next_link}"
-                else:
+                
+                elif parsed_link.netloc == trusted_hostname:
                     next_url = next_link
+                    
+                else:
+                    print(f"\nError: Received invalid or untrusted pagination link: {next_link}")
+                    print("Aborting to prevent potential SSRF.")
+                    return None # Stop processing
             else:
                 next_url = None
 
-            time.sleep(RATE_LIMIT_DELAY) 
+            time.sleep(RATE_LIMIT_DELAY)
 
         except requests.exceptions.HTTPError as e:
             print(f"\nError fetching projects: {e}")
@@ -165,6 +178,10 @@ def main():
 
     org_id = input("Enter your Organization ID: ")
 
+    if not re.match(r"^[a-fA-F0-9]{8}-([a-fA-F0-9]{4}-){3}[a-fA-F0-9]{12}$", org_id):
+        print(f"\nError: Invalid Organization ID format. Please enter a valid UUID.")
+        sys.exit(1)
+
     print("Allowed frequency:", ", ".join(ALLOWED_FREQUENCY))
     print("Note: SAST and IAC configurations can only be set to weekly or never. Contact your account team if you would like to test daily.")
     frequency = input("Enter your desired test frequency: ")
@@ -185,10 +202,10 @@ def main():
     elif use_all_sca:
         print("\n--sca flag detected. Filtering by open source project types.")
         selected_types = list(ALL_OPEN_SOURCE)
-    elif use_all_sca:
+    elif use_all_iac:
         print("\n--iac flag detected. Filtering by IAC project types.")
         selected_types = list(ALL_IAC)
-    elif use_all_sca:
+    elif use_all_container:
         print("\n--container flag detected. Filtering by container project types.")
         selected_types = list(ALL_CONTAINER)
     else:
@@ -247,6 +264,12 @@ def main():
             i += 1 # Move to the next project
             continue
 
+        if not re.match(r"^[a-fA-F0-9]{8}-([a-fA-F0-9]{4}-){3}[a-fA-F0-9]{12}$", project_id):
+            print(f"  [{current_index_display}/{project_count}] Skipping item, invalid project ID format: {project_id}")
+            failed_count += 1
+            i += 1 # Move to the next project
+            continue
+
         print(f"  [{current_index_display}/{project_count}] Updating project: {project_name} (ID: {project_id})")
         
         result = update_project_frequency(org_id, project_id, api_token, frequency)
@@ -257,6 +280,7 @@ def main():
             i += 1 # Move to the next project
         elif result == "retry":
             print(f"    > Retrying update for project {project_id}...")
+            # Note: i is NOT incremented, so the loop repeats for this project
         else: # Result is False
             print(f"    > Failed.")
             failed_count += 1
